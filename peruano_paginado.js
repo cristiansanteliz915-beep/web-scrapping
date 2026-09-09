@@ -2,17 +2,16 @@ const puppeteer = require('puppeteer');
 const cheerio = require('cheerio');
 const fs = require('fs');
 
-// FUNCIÓN AUXILIAR: Añade pausas explícitas asíncronas
 const esperar = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function scrapingConPaginacion() {
     let browser;
-    const TARGET_URL = 'https://elperuano.pe';
+    const TARGET_URL = 'https://diariooficial.elperuano.pe/Normas';
     const totalPaginasAMonitorear = 3; 
     let paginaActual = 1;
     const todasLasNormas = [];
 
-    console.log('[🚀 PAGINACIÓN-INIT] Inicializando pipeline tolerante a fallos de red...');
+    console.log('[🚀 PAGINACIÓN-INIT] Lanzando pipeline con selectores de producción...');
 
     try {
         browser = await puppeteer.launch({ 
@@ -24,73 +23,66 @@ async function scrapingConPaginacion() {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
         await page.setViewport({ width: 1280, height: 800 });
 
-        // --- SISTEMA DE REINTENTOS AUTOMÁTICOS CONTRA CAÍDAS DEL SERVIDOR ---
         let conexionExitosa = false;
         let intentos = 1;
         const maxIntentos = 4;
 
         while (!conexionExitosa && intentos <= maxIntentos) {
             try {
-                console.log(`[🌐 CONNECT] Intentando conectar a El Peruano (Intento ${intentos}/${maxIntentos})...`);
-                // Usamos 'domcontentloaded' que es más rápido y menos propenso a colgarse
+                console.log(`[🌐 CONNECT] Conectando a El Peruano (Intento ${intentos}/${maxIntentos})...`);
+                // Esperamos que asiente el DOM base de la web
                 await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
                 conexionExitosa = true;
-                console.log('[🎯 CONNECTED] ¡Conexión establecida con éxito!');
+                console.log('[🎯 CONNECTED] ¡Conexión de red establecida!');
             } catch (err) {
-                console.error(`[⚠️ ALERT] El servidor no responde (${err.message}).`);
-                if (intentos === maxIntentos) throw new Error('El portal del Estado está totalmente caído. Reintentos agotados.');
-                
-                const tiempoEspera = intentos * 5000; // Espera 5s, luego 10s, luego 15s...
-                console.log(`[⏳ RETRY] Servidor saturado. Reintentando automáticamente en ${tiempoEspera / 1000} segundos...`);
+                console.error(`[⚠️ ALERT] Fallo de red (${err.message}).`);
+                if (intentos === maxIntentos) throw new Error('Servidor inaccesible.');
+                const tiempoEspera = intentos * 4000;
                 await esperar(tiempoEspera);
                 intentos++;
             }
         }
 
-        // --- BUCLE PRINCIPAL DE EXTRACCIÓN Y PAGINACIÓN ---
         while (paginaActual <= totalPaginasAMonitorear) {
-            console.log(`\n[📖 PAGE ${paginaActual}] Procesando datos dinámicos del boletín...`);
-
-            // Espera de asentamiento para que carguen los scripts internos de la web
-            await esperar(4000);
+            console.log(`\n[📖 PAGE ${paginaActual}] Descargando tabla de resoluciones...`);
+            
+            // Pausa obligatoria para que los scripts del portal terminen de cargar el boletín
+            await esperar(5000);
 
             const htmlContent = await page.content();
             const $ = cheerio.load(htmlContent);
 
             let registrosEnEstaPagina = 0;
 
-            // Selector universal por palabras clave legales en Perú
+            // RESTRUCTURACIÓN DE SELECTOR: Buscamos las clases nativas y cualquier bloque con enlace PDF del boletín
             $('a').each((index, element) => {
                 const textoEnlace = $(element).text().trim();
                 const enlaceUrl = $(element).attr('href');
-                const textoMinuscula = textoEnlace.toLowerCase();
 
-                const esNormaLegitima = 
-                    textoMinuscula.includes('decreto') || 
-                    textoMinuscula.includes('resolucion') || 
-                    textoMinuscula.includes('ley ') || 
-                    textoMinuscula.includes('directiva') || 
-                    textoMinuscula.includes('ordenanza');
-
-                if (enlaceUrl && esNormaLegitima && textoEnlace.length > 15) {
-                    todasLasNormas.push({
-                        id: todasLasNormas.length + 1,
-                        pagina_origen: paginaActual,
-                        entidad_emisora: "Diario Oficial El Peruano",
-                        descripcion: textoEnlace,
-                        url_pdf: enlaceUrl.startsWith('http') ? enlaceUrl : `https://elperuano.pe${enlaceUrl}`
-                    });
-                    registrosEnEstaPagina++;
+                // Capturamos cualquier enlace que apunte a la descarga de una norma o cuadernillo PDF del día
+                if (enlaceUrl && (enlaceUrl.includes('/Normas') || enlaceUrl.includes('.pdf') || enlaceUrl.includes('/descarga/'))) {
+                    // Filtramos textos basura del menú o botones laterales cortos
+                    if (textoEnlace.length > 12) {
+                        todasLasNormas.push({
+                            id: todasLasNormas.length + 1,
+                            pagina_origen: paginaActual,
+                            entidad_emisora: "Diario Oficial El Peruano",
+                            descripcion: textoEnlace.replace(/\s+/g, ' '), // Limpia espacios en blanco extras
+                            url_pdf: enlaceUrl.startsWith('http') ? enlaceUrl : `https://diariooficial.elperuano.pe${enlaceUrl}`
+                        });
+                        registrosEnEstaPagina++;
+                    }
                 }
             });
 
-            console.log(`[🎯 PARSING] Se extrajeron ${registrosEnEstaPagina} normas en la página ${paginaActual}.`);
+            console.log(`[🎯 PARSING] Éxito: Se indexaron ${registrosEnEstaPagina} registros en la página ${paginaActual}.`);
 
+            // Si por un cambio severo de diseño en la página siguiente sale 0, rompemos para no ciclar el bot
             if (registrosEnEstaPagina === 0 || paginaActual === totalPaginasAMonitorear) {
                 break;
             }
 
-            // Buscar botón Siguiente de forma segura en el DOM
+            // Buscar el botón interactivo de "Siguiente"
             const botonExiste = await page.evaluate(() => {
                 const btn = document.querySelector('a.page-link[aria-label="Next"], .pagination .next a, li.next a, a[rel="next"], .next a');
                 if (btn) return true;
@@ -100,7 +92,7 @@ async function scrapingConPaginacion() {
             });
 
             if (botonExiste) {
-                console.log(`[👉 ACTION] Avanzando de forma autónoma a la página ${paginaActual + 1}...`);
+                console.log(`[👉 ACTION] Clic virtual. Solicitando acceso a la página ${paginaActual + 1}...`);
                 
                 await page.evaluate(() => {
                     const btn = document.querySelector('a.page-link[aria-label="Next"], .pagination .next a, li.next a, a[rel="next"], .next a');
@@ -115,31 +107,31 @@ async function scrapingConPaginacion() {
 
                 paginaActual++;
             } else {
-                console.log('[🛑 END] Se llegó al final de las páginas web disponibles.');
+                console.log('[🛑 END] Se alcanzó el límite de páginas de la plataforma.');
                 break;
             }
         }
 
         await browser.close();
-        console.log('\n[🔒 CLOSE] Navegador web liberado.');
+        console.log('\n[🔒 CLOSE] Instancia Chromium cerrada de forma segura.');
 
-        // Guardar la data consolidada
+        // Guardar la data estructurada
         fs.writeFileSync('normas_paginadas.json', JSON.stringify(todasLasNormas, null, 2), 'utf-8');
-        console.log(`[💾 STORAGE] Base de datos JSON actualizada: ${todasLasNormas.length} registros.`);
+        console.log(`[💾 STORAGE] Base de datos consolidada: ${todasLasNormas.length} registros guardados.`);
 
-        // Estructurar reporte para Microsoft Excel
-        let csvContent = 'ID;Página Origen;Entidad Emisora;Descripción / Sumilla;Enlace PDF\n';
+        // Inyección de filas al reporte nativo para Microsoft Excel
+        let csvContent = 'ID;Página Origen;Entidad Emisora;Descripción Jurídica;Enlace de Descarga PDF\n';
         todasLasNormas.forEach(norma => {
-            const descLimpia = norma.descripcion.replace(/;/g, ',').replace(/\n/g, ' ');
+            const descLimpia = norma.descripcion.replace(/;/g, ',').replace(/"/g, '""');
             csvContent += `${norma.id};${norma.pagina_origen};"${norma.entidad_emisora}";"${descLimpia}";"${norma.url_pdf}"\n`;
         });
 
         const BOM = '\uFEFF';
         fs.writeFileSync('reporte_paginado_excel.csv', BOM + csvContent, 'utf-8');
-        console.log('[📊 EXCEL-READY] ¡Tu reporte de Excel fue re-generado con éxito!');
+        console.log('[📊 EXCEL-READY] ¡Tu archivo Excel se actualizó físicamente con las nuevas filas!');
 
     } catch (error) {
-        console.error('[❌ PIPELINE CRASH]: Fallo definitivo de red:', error.message);
+        console.error('[❌ PIPELINE CRASH]: Fallo crítico general:', error.message);
         if (browser) await browser.close();
     }
 }
